@@ -8,15 +8,24 @@ both synchronous and asynchronous tests, making it versatile for various
 testing scenarios.
 """
 
-import docker  # type: ignore
-from docker.models.containers import Container  # type: ignore
+__author__ = "Julien Rialland"
+__version__ = "0.1.0"
+
+import os
 import asyncio
 import logging
 import socket
 import time
-from dataclasses import dataclass
+import shutil
+import subprocess
+import inspect
+import tempfile
+import yaml
+import docker  # type: ignore
+from docker.models.containers import Container  # type: ignore
 
-from typing import Callable, Awaitable, TypeVar
+from dataclasses import dataclass
+from typing import Callable, TypeVar
 
 
 # ------------------------------------------------------------------------------
@@ -104,15 +113,71 @@ class using_containers:
         else:
             raise ValueError(f"Invalid definition: '{definition}'")
 
-    def __init__(self, *args):
+    def __init__(self, *args, **kwargs):
+
         self.logger = logging.getLogger(__name__)
         self.definitions = list(self.read_definitions(args))
-        self.containers: dict[str, Container] = {} # type: ignore
         self.client = docker.from_env()
+        self.docker_command = kwargs.get("docker_command", shutil.which("docker"))
+        self.compose_files = kwargs.get("compose_files", [])
 
-    def __enter__(self):
-        self.containers.clear()
-        
+        self._live_containers: dict[str, Container] = {}  # type: ignore
+        self._cleanup_fns = []
+
+        # check if docker is available, otherwise fallback to podman
+        if self.docker_command is None:
+            self.docker_command = shutil.which(
+                "podman"
+            )  # fallback to podman if docker is not available
+
+        # accept a single definition as a keyword argument
+        if "compose_file" in kwargs:
+            self.compose_files.append(kwargs["compose_file"])
+
+        # accept inline compose files as a keyword argument (string or dict)
+        if "inline_compose" in kwargs:
+            # create a temporary directory to store the inline compose file
+            temp_dir = tempfile.mkdtemp()
+            compose_file = os.path.join(temp_dir, "docker-compose.yml")
+
+            with open(compose_file, "w") as f:
+                if isinstance(kwargs["inline_compose"], str):
+                    f.write(kwargs["inline_compose"])
+                else:
+                    # try to convert the object into yaml and write it to the file
+                    yaml.dump(kwargs["inline_compose"], f)
+
+            self.compose_files.append(compose_file)
+            self._cleanup_fns.append(lambda: shutil.rmtree(temp_dir))
+
+        # accept a dictionary of environment variables to pass to the compose command
+        self.compose_env = kwargs.get("compose_env", {})
+
+        # accept a flag to build images before starting compose
+        self.compose_build = kwargs.get(
+            "compose_build", True
+        )  # build images before starting compose
+
+        # if there are compose files do some extra checks
+        if self.compose_files:
+
+            assert (
+                self.docker_command
+            ), "docker_command not found. an installation of docker or podman is required to use compose files"
+
+            # check that the compose files exist
+            for compose_file in self.compose_files:
+                assert os.path.isfile(
+                    compose_file
+                ), f"compose file not found: {compose_file}"
+
+    def __del__(self):
+        for fn in self._cleanup_fns:
+            fn()
+
+    def _start_containers(self):
+        self._live_containers.clear()
+
         for definition in self.definitions:
 
             if definition.build:
@@ -138,12 +203,19 @@ class using_containers:
 
             self.logger.info(f"Creating container {definition.name}")
 
+            # for some reason, port definitions are reversed, so fix it
+            ports = (
+                {str(v): str(k) for k, v in definition.ports.items()}
+                if definition.ports
+                else None
+            )
+
             container = self.client.containers.create(
                 image,
                 detach=True,
                 auto_remove=True,
                 name=definition.name,
-                ports=definition.ports,
+                ports=ports,
                 environment=definition.environment,
                 volumes=definition.volumes,
                 working_dir=definition.working_dir,
@@ -151,31 +223,88 @@ class using_containers:
                 command=definition.command,
             )
 
-            self.containers[container.name] = container
+            self._live_containers[container.name] = container
 
         # start all containers
-        for container in self.containers.values():
+        for container in self._live_containers.values():
             self.logger.info(f"Starting container {container.id}")
             container.start()
 
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-
+    def _stop_containers(self):
         # Stop and remove all containers that were created
-        for container in self.containers.values():
+        for container in self._live_containers.values():
             self.logger.info(f"Stopping container {container.id}")
             container.stop()
             self.logger.info(f"Removing container {container.id}")
             container.remove()
 
-    def __call__(self, func):
+    def _start_compose(self):
+        env = os.environ.copy()
+        env.update(self.compose_env)
+        # pre-build images if specified
+        if self.compose_build:
+            for compose_file in self.compose_files:
+                self.logger.info(f"Building images for file {compose_file}")
+                subprocess.check_output(
+                    [
+                        self.docker_command,
+                        "compose",
+                        "-f",
+                        os.path.basename(compose_file),
+                        "build",
+                    ],
+                    cwd=os.path.dirname(compose_file),
+                    env=env,
+                )
 
+        for compose_file in self.compose_files:
+            self.logger.info(f"Starting docker-compose with file {compose_file}")
+            subprocess.check_output(
+                [
+                    self.docker_command,
+                    "compose",
+                    "-f",
+                    os.path.basename(compose_file),
+                    "up",
+                    "-d",
+                ],
+                env=env,
+                cwd=os.path.dirname(compose_file),
+            )
+
+    def _stop_compose(self):
+        for compose_file in self.compose_files:
+            self.logger.info(f"Stopping docker-compose with file {compose_file}")
+            subprocess.check_output(
+                [
+                    self.docker_command,
+                    "compose",
+                    "-f",
+                    os.path.basename(compose_file),
+                    "down",
+                ],
+                cwd=os.path.dirname(compose_file),
+            )
+
+    def __enter__(self) -> "using_containers":
+        self._start_containers()
+        self._start_compose()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self._stop_compose()
+        self._stop_containers()
+
+    def __call__(self, func):
+        expects_param = len(inspect.signature(func).parameters) == 1
         if asyncio.iscoroutinefunction(func):
 
             async def async_wrapper(*args, **kwargs):
                 with self:
-                    return await func(*args, **kwargs)
+                    if expects_param:
+                        return await func(self)
+                    else:
+                        return await func(*args, **kwargs)
 
             return async_wrapper
 
@@ -183,19 +312,23 @@ class using_containers:
 
             def wrapper(*args, **kwargs):
                 with self:
-                    return func(*args, **kwargs)
+                    if expects_param:
+                        return func(self)
+                    else:
+                        return func(*args, **kwargs)
 
             return wrapper
 
-    def exec(self, container:str, command:str|list[str], **kwargs) -> tuple:
+    def exec(self, container: str, command: str | list[str], **kwargs) -> tuple:
         """
         Execute a command in a running container and return the output
         """
         container = self.client.containers.get(container)
         return container.exec_run(command, **kwargs)
-    
-    def run(self, image, command:str|list[str], **kwargs):
+
+    def run(self, image, command: str | list[str], **kwargs):
         return self.client.containers.run(image, command, **kwargs)
+
 
 T = TypeVar("T")
 
@@ -266,7 +399,7 @@ def _make_tcp_condition(host, port) -> Callable[[], bool]:
 
 # ------------------------------------------------------------------------------
 def wait_for_tcp_port(
-    host="localhost", port: int = 0, timeout=10, poll_interval=0.1
+    port: int = 0, host="localhost", timeout=10, poll_interval=0.1
 ) -> bool:
     """Wait for a port to be open on a host"""
     return wait_for(
@@ -276,9 +409,29 @@ def wait_for_tcp_port(
 
 # ------------------------------------------------------------------------------
 async def async_wait_for_tcp_port(
-    host="localhost", port: int = 0, timeout=10, poll_interval=0.1
+    port: int = 0, host="localhost", timeout=10, poll_interval=0.1
 ) -> bool:
     """Wait for a port to be open on a host"""
     return await async_wait_for(
         _make_tcp_condition(host, port), timeout, poll_interval, f"tcp {host}:{port}"
     )
+
+
+# ------------------------------------------------------------------------------
+def get_free_tcp_port(host="localhost") -> int:
+    """
+    Get a free TCP port
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind((host, 0))
+        return s.getsockname()[1]
+
+
+__all__ = [
+    "using_containers",
+    "wait_for",
+    "async_wait_for",
+    "wait_for_tcp_port",
+    "async_wait_for_tcp_port",
+    "get_free_tcp_port",
+]
