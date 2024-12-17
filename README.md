@@ -23,7 +23,7 @@ import requests
 
 @using_containers({
     "image": "lipanski/docker-static-website:latest",
-    "ports": {"3000": 2000}
+    "ports": {"2000": 3000}
 })
 def test_basic():
     wait_for_tcp_port(port=2000)
@@ -44,7 +44,7 @@ def mystack():
     with using_containers({
         "image": "alpine:latest",
         "name": "mycontainer",
-        "command": "tail -f /dev/null",
+        "command": "tail -f /dev/null", # to keep it alive
     }) as stack:
         yield stack 
 
@@ -53,7 +53,11 @@ def test_itworks(mystack):
     assert exit_code == 0
     assert output == b"Hello, world!\n"
 
+...
+
 ```
+
+This example shows how to separate the declaration of the stack, and its use in various tests. 
 
 ### Asynchronous Tests
 
@@ -92,7 +96,34 @@ async def test_async():
     await conn.close()
 ```
 
-In the above example, the `@using_containers` decorator is used to run a PostgreSQL container during the test. The `async_wait_for` function is used to wait for the PostgreSQL server to be ready before running the test.
+In the above example, the `@using_containers` decorator is used to run a PostgreSQL container during the test. The `async_wait_for` function is used to wait for the PostgreSQL server to be ready before running the test. Then we check that we can open a connection using the asyncpg library.
+
+### using compose files / inline compose
+* You may describe the stack in a compose file. In this case the library does not interact with docker API directly, but runs the compose command instead.
+
+
+```python
+@using_containers(compose_file="docker-compose.yml", compose_env={"PORT": "21356"})
+def test_using_compose(stack):
+    wait_for_tcp_port(free_tcp_port)
+```
+
+* The content of a compose file may be passed directly, in this case a temporary yaml file is created before running the stack :
+
+```python
+@using_containers(
+    inline_compose={
+        "services": {
+            "web": {
+                "image": "nginx:latest",
+                "ports": [f"{free_tcp_port}:80"],
+            },
+        },
+    }
+)
+def test_check_inline_compose_works(stack: using_containers):
+    wait_for_tcp_port(free_tcp_port)
+```
 
 ## API
 
@@ -125,10 +156,6 @@ Asynchronously wait for a TCP port to be open on a host.
 - `port` (int): The port to check. Default is 0.
 - `timeout` (int): The timeout in seconds. Default is 10.
 - `poll_interval` (float): The polling interval in seconds. Default is 0.1.
-
-## TODO
-
-    this library does not handle compose files yet.
 
 ## License
 
