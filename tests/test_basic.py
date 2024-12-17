@@ -1,16 +1,23 @@
 import pytest
 from pytestcontainers import using_containers, wait_for_tcp_port, async_wait_for
 import requests
+import os
 
+test_index_html = os.path.join(os.path.dirname(__file__), "test_index.html")
 
 # ------------------------------------------------------------------------------
 @using_containers(
-    {"image": "lipanski/docker-static-website:latest", "ports": {"3000": 2000}}
+    {
+        "image": "lipanski/docker-static-website:latest",
+        "ports": {"2000": 3000},
+        "volumes": [f"{test_index_html}:/home/static/index.html:ro"],
+    }
 )
 def test_basic():
     wait_for_tcp_port(port=2000)
-    response = requests.get("http://localhost:2000")
-    assert response.status_code == 404
+    response = requests.get("http://localhost:2000/index.html")
+    assert response.status_code == 200
+    assert "Can you read ?" in response.text
 
 
 # ------------------------------------------------------------------------------
@@ -19,7 +26,7 @@ def test_basic():
     {
         "image": "postgres:17-alpine",
         "name": "postgres",
-        "ports": {"5432/tcp": 5432},
+        "ports": {"5432": 5432},
         "environment": {
             "POSTGRES_USER": "postgresuser",
             "POSTGRES_PASSWORD": "postgrespassword",
