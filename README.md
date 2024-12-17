@@ -31,6 +31,30 @@ def test_basic():
     assert response.status_code == 404
 ```
 
+## Use the same containers across multiple tests
+
+You may use pytest fixtures :
+
+```python
+import pytest
+from pytestcontainers import using_containers
+
+@pytest.fixture(scope="module") # Possible values for scope are: function, class, module, package or session
+def mystack():
+    with using_containers({
+        "image": "alpine:latest",
+        "name": "mycontainer",
+        "command": "tail -f /dev/null",
+    }) as stack:
+        yield stack 
+
+def test_itworks(mystack):
+    exit_code, output = mystack.exec("mycontainer", "echo Hello, world!")
+    assert exit_code == 0
+    assert output == b"Hello, world!\n"
+
+```
+
 ### Asynchronous Tests
 
 `pytestcontainers` also supports asynchronous tests with the @using_containers decorator:

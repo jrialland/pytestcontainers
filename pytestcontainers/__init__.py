@@ -107,19 +107,19 @@ class using_containers:
     def __init__(self, *args):
         self.logger = logging.getLogger(__name__)
         self.definitions = list(self.read_definitions(args))
-        self.containers: set[Container] = set()  # type: ignore
+        self.containers: dict[str, Container] = {} # type: ignore
+        self.client = docker.from_env()
 
     def __enter__(self):
         self.containers.clear()
-        client = docker.from_env()
-
+        
         for definition in self.definitions:
 
             if definition.build:
 
                 self.logger.info(f"Building image {definition.build.context}")
 
-                client.images.build(
+                self.client.images.build(
                     path=definition.build.context,
                     dockerfile=definition.build.dockerfile,
                     tag=definition.build.tag,
@@ -130,7 +130,7 @@ class using_containers:
 
                 self.logger.info(f"Pulling image {definition.image}")
 
-                client.images.pull(definition.image)
+                self.client.images.pull(definition.image)
             else:
                 raise ValueError("Invalid definition: missing image or build")
 
@@ -138,7 +138,7 @@ class using_containers:
 
             self.logger.info(f"Creating container {definition.name}")
 
-            container = client.containers.create(
+            container = self.client.containers.create(
                 image,
                 detach=True,
                 auto_remove=True,
@@ -151,17 +151,19 @@ class using_containers:
                 command=definition.command,
             )
 
-            self.containers.add(container)
+            self.containers[container.name] = container
 
         # start all containers
-        for container in self.containers:
+        for container in self.containers.values():
             self.logger.info(f"Starting container {container.id}")
             container.start()
+
+        return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
 
         # Stop and remove all containers that were created
-        for container in self.containers:
+        for container in self.containers.values():
             self.logger.info(f"Stopping container {container.id}")
             container.stop()
             self.logger.info(f"Removing container {container.id}")
@@ -185,6 +187,15 @@ class using_containers:
 
             return wrapper
 
+    def exec(self, container:str, command:str|list[str], **kwargs) -> tuple:
+        """
+        Execute a command in a running container and return the output
+        """
+        container = self.client.containers.get(container)
+        return container.exec_run(command, **kwargs)
+    
+    def run(self, image, command:str|list[str], **kwargs):
+        return self.client.containers.run(image, command, **kwargs)
 
 T = TypeVar("T")
 
