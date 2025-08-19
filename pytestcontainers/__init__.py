@@ -113,6 +113,15 @@ class using_containers:
         else:
             raise ValueError(f"Invalid definition: '{definition}'")
 
+    def make_temp_dir(self,**kwargs):
+        temp_dir = tempfile.mkdtemp()
+        self._cleanup_fns.append(lambda: shutil.rmtree(temp_dir))
+        # if the kwargs contain a 'stack_name' parameter, create a subdir, so compose context will reuse the same name
+        if "stack_name" in kwargs:
+            temp_dir = os.path.join(temp_dir, kwargs["stack_name"])
+            os.makedirs(temp_dir, exist_ok=True)
+        return temp_dir
+
     def __init__(self, *args, **kwargs):
 
         self.logger = logging.getLogger(__name__)
@@ -137,7 +146,7 @@ class using_containers:
         # accept inline compose files as a keyword argument (string or dict)
         if "inline_compose" in kwargs:
             # create a temporary directory to store the inline compose file
-            temp_dir = tempfile.mkdtemp()
+            temp_dir = self.make_temp_dir(**kwargs)
             compose_file = os.path.join(temp_dir, "docker-compose.yml")
 
             with open(compose_file, "w") as f:
@@ -148,7 +157,6 @@ class using_containers:
                     yaml.dump(kwargs["inline_compose"], f)
 
             self.compose_files.append(compose_file)
-            self._cleanup_fns.append(lambda: shutil.rmtree(temp_dir))
 
         # accept a dictionary of environment variables to pass to the compose command
         self.compose_env = kwargs.get("compose_env", {})
@@ -231,12 +239,17 @@ class using_containers:
             container.start()
 
     def _stop_containers(self):
-        # Stop and remove all containers that were created
+        # Stop all containers that were created
+        # Since containers are created with auto_remove=True, they will be automatically
+        # removed when stopped, so we don't need to manually remove them
         for container in self._live_containers.values():
-            self.logger.info(f"Stopping container {container.id}")
-            container.stop()
-            self.logger.info(f"Removing container {container.id}")
-            container.remove()
+            try:
+                self.logger.info(f"Stopping container {container.id}")
+                container.stop()
+            except (docker.errors.NotFound, docker.errors.APIError, ConnectionError, Exception) as e:
+                # Container doesn't exist anymore or Docker daemon connection issues
+                # This is fine during cleanup
+                self.logger.debug(f"Error stopping container {container.id}: {e}")
 
     def _start_compose(self):
         env = os.environ.copy()

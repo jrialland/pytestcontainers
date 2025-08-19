@@ -16,6 +16,7 @@ def test_check_compose_works(stack: using_containers):
 
 # ------------------------------------------------------------------------------
 @using_containers(
+    stack_name="inline_compose_test",    
     inline_compose={
         "services": {
             "web": {
